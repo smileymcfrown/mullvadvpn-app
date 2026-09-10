@@ -1,29 +1,35 @@
 ---
-# Keeps this fork's Tailscale LAN patch on top of upstream Mullvad releases.
+# Builds this fork (upstream Mullvad plus the extra local networks patch) against
+# the newest upstream release, once a day and on demand.
 #
-# What it does, once a day (and on demand):
+# What it does:
 #   1. Fetches upstream (mullvad/mullvadvpn-app) and picks the newest stable
 #      desktop release tag (YYYY.N), unless a tag is given as an input.
-#   2. Applies this fork's own changes (the net diff of everything not in
-#      upstream/main) onto that tag as one commit, using a three-way merge.
-#   3. Regenerates the Rust constant from extra-lan-networks.txt (so editing
-#      only the text file is enough), then verifies that it parses, every
-#      entry ends up in the compiled list, and the talpid-types tests pass.
-#   4. Pushes the result to the branch `tailscale-lan/<tag>`.
-#   5. Builds the Linux .deb/.rpm from that branch inside Mullvad's own build
-#      container, and the Windows installer .exe on a GitHub-hosted Windows
-#      runner, and uploads both as workflow artifacts.
+#   2. Skips the run if artifacts for that release already exist, so the daily
+#      schedule only does work when upstream has actually released something.
+#   3. In each build job, applies this fork's changes onto that release with
+#      ci/apply-extra-lan-patch.sh (a three-way merge of the fork's net diff,
+#      which also regenerates the Rust constant from extra-lan-networks.txt),
+#      runs the talpid-types tests, and builds.
+#   4. Uploads the Linux .deb/.rpm (built inside Mullvad's own build container)
+#      and the Windows installer .exe as workflow artifacts.
+#
+# Nothing is pushed to this repository. Pushing a branch built from an upstream
+# release is not possible from Actions: such a branch necessarily changes files
+# under .github/workflows/, and the automatic GITHUB_TOKEN is never allowed to
+# create or update workflow files, with no permission setting that lifts it.
+# To reproduce a build locally instead, run the same script by hand:
+#
+#   ci/apply-extra-lan-patch.sh <tag> && ./build.sh --optimize
 #
 # If the patch does not apply cleanly the run fails and GitHub emails the
-# repository owner; nothing is pushed. Fix the conflict locally, push, and
-# re-run.
+# repository owner. Resolve it locally, commit, and re-run.
 #
 # Notes for the fork owner:
 #   - GitHub only runs `schedule` triggers from the default branch, and it
 #     disables scheduled workflows on forks until you enable them once under
 #     the Actions tab. It also pauses them after 60 days without repo activity.
-#   - macOS builds are not produced here. Check out the `tailscale-lan/<tag>`
-#     branch and build locally per BuildInstructions.md.
+#   - macOS is not built here. Use the local command above.
 #   - The networks to treat as local come from extra-lan-networks.txt in the
 #     repository root. Edit that file, commit, and run this workflow.
 #   - See docs/fork-tailscale-lan.md for the full story.
@@ -34,19 +40,19 @@ on:
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: Upstream tag to rebase onto (default is the newest stable YYYY.N tag)
+        description: Upstream release tag to build (default is the newest stable YYYY.N tag)
         type: string
         required: false
       force:
-        description: Recreate the tailscale-lan/<tag> branch even if it already exists
+        description: Build even if artifacts for that release already exist
         type: boolean
         default: false
       build_linux:
-        description: Build Linux packages after a successful rebase
+        description: Build Linux packages
         type: boolean
         default: true
       build_windows:
-        description: Build the Windows installer after a successful rebase
+        description: Build the Windows installer
         type: boolean
         default: true
 
@@ -57,27 +63,25 @@ concurrency:
 permissions: {}
 
 jobs:
-  rebase:
-    name: Rebase patch onto upstream release
+  prepare:
+    name: Pick upstream release
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      actions: read
     outputs:
       tag: ${{ steps.pick.outputs.tag }}
-      branch: ${{ steps.pick.outputs.branch }}
-      pushed: ${{ steps.push.outputs.pushed }}
-      container_image: ${{ steps.push.outputs.container_image }}
+      container_image: ${{ steps.pick.outputs.container_image }}
+      skip: ${{ steps.built.outputs.skip }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
-          persist-credentials: true
 
-      - name: Fetch upstream
+      - name: Fetch upstream tags
         run: |
           git remote add upstream https://github.com/mullvad/mullvadvpn-app.git
-          git fetch --no-tags upstream main
           git fetch --no-tags upstream '+refs/tags/*:refs/remotes/upstream-tags/*'
 
       - name: Pick upstream release tag
@@ -100,128 +104,70 @@ jobs:
           fi
           echo "Using upstream tag $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "branch=tailscale-lan/$tag" >> "$GITHUB_OUTPUT"
+          # Build Linux inside the container that release itself was built with.
+          image=$(git show "refs/remotes/upstream-tags/$tag:building/linux-container-image.txt")
+          echo "container_image=$image" >> "$GITHUB_OUTPUT"
 
-      - name: Skip if branch already exists
-        id: exists
+      - name: Skip releases that were already built
+        id: built
         env:
-          BRANCH: ${{ steps.pick.outputs.branch }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.pick.outputs.tag }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          if [ "$FORCE" != "true" ] && git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
-            echo "Branch $BRANCH already exists on origin; nothing to do."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
+          if [ "$FORCE" = "true" ]; then
+            echo "Forced; building regardless of existing artifacts."
             echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-
-      - name: Apply fork changes onto the release tag
-        if: steps.exists.outputs.skip != 'true'
-        env:
-          TAG: ${{ steps.pick.outputs.tag }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          base=$(git merge-base HEAD upstream/main)
-          head=$(git rev-parse HEAD)
-          echo "Fork commits to carry over (squashed into one):"
-          git log --oneline "$base..$head"
-          echo "Files changed by the fork:"
-          git diff --stat "$base" "$head"
-          # Apply the fork's net diff on top of the tag with a three-way merge.
-          # This works whether the tag is newer or older than the commit the fork
-          # is based on, and cannot trip over intermediate commit states.
-          git checkout -q --detach "refs/remotes/upstream-tags/$TAG"
-          if ! git diff --binary "$base" "$head" | git apply -3 --index; then
-            echo "::error::The fork's changes do not apply cleanly onto $TAG. Conflicting files:"
-            git diff --name-only --diff-filter=U || true
-            echo "::error::Resolve locally and push tailscale-lan/$TAG by hand."
-            exit 1
-          fi
-          git commit -q -m "Apply extra local networks patch onto $TAG" \
-            -m "Squashed from fork commits $base..$head."
-          echo "Result:"
-          git log --oneline -1
-          git diff --stat "refs/remotes/upstream-tags/$TAG" HEAD
-
-      - name: Regenerate the extra networks constant and verify
-        if: steps.exists.outputs.skip != 'true'
-        run: |
-          set -euo pipefail
-          for f in extra-lan-networks.txt talpid-types/src/bin/generate-extra-lan-nets.rs; do
-            if [ ! -f "$f" ]; then
-              echo "::error::$f is missing after applying the patch"
-              exit 1
+          names=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired == false) | .name' || true)
+          skip=true
+          for platform in linux windows; do
+            if ! grep -qx "mullvad-tailscale-lan-$TAG-$platform" <<<"$names"; then
+              skip=false
             fi
           done
-          echo "Extra LAN networks that will be compiled in:"
-          grep -v '^\s*#' extra-lan-networks.txt | grep -v '^\s*$' || echo "(none)"
-          # rustup installs the version pinned in rust-toolchain.toml on first use.
-          rustup show active-toolchain
-          # Parses extra-lan-networks.txt (fails on bad entries) and rewrites the
-          # Rust constant if the text file was edited without regenerating it.
-          cargo run --locked -q -p talpid-types --bin generate-extra-lan-nets
-          if ! git diff --quiet -- talpid-types/src/net/extra_lan_nets.rs; then
-            echo "extra_lan_nets.rs was out of date; including the regenerated file"
-            git add talpid-types/src/net/extra_lan_nets.rs
-            git commit -q --amend --no-edit
+          if [ "$skip" = "true" ]; then
+            echo "Artifacts for $TAG already exist; nothing to do."
+            echo "Re-run with the 'force' input to rebuild." >> "$GITHUB_STEP_SUMMARY"
           fi
-          # Checks that every entry made it into ALLOWED_LAN_NETS, among other things.
-          cargo test --locked -p talpid-types
-
-      - name: Push tailscale-lan branch
-        id: push
-        if: steps.exists.outputs.skip != 'true'
-        env:
-          BRANCH: ${{ steps.pick.outputs.branch }}
-          FORCE: ${{ inputs.force }}
-        run: |
-          set -euo pipefail
-          force_flag=""
-          if [ "$FORCE" = "true" ]; then
-            force_flag="--force"
-          fi
-          git push $force_flag origin "HEAD:refs/heads/$BRANCH"
-          echo "pushed=true" >> "$GITHUB_OUTPUT"
-          echo "container_image=$(cat ./building/linux-container-image.txt)" >> "$GITHUB_OUTPUT"
-          {
-            echo "## Applied onto upstream \`${{ steps.pick.outputs.tag }}\`"
-            echo
-            echo "Pushed branch \`$BRANCH\`. Files changed relative to the release:"
-            echo
-            echo '```'
-            git diff --stat "refs/remotes/upstream-tags/${{ steps.pick.outputs.tag }}" HEAD
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
 
   build-linux:
     name: Build Linux packages
-    needs: rebase
+    needs: prepare
     if: |
-      needs.rebase.outputs.pushed == 'true' &&
+      needs.prepare.outputs.skip != 'true' &&
       (github.event_name != 'workflow_dispatch' || inputs.build_linux)
     runs-on: ubuntu-latest
     permissions:
       contents: read
     container:
-      image: ${{ needs.rebase.outputs.container_image }}
+      image: ${{ needs.prepare.outputs.container_image }}
     steps:
       # Fix for HOME path overridden by GH runners when building in containers, see:
       # https://github.com/actions/runner/issues/863
       - name: Fix HOME path
         run: echo "HOME=/root" >> $GITHUB_ENV
 
-      - name: Checkout tailscale-lan branch
+      - name: Checkout fork
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          ref: ${{ needs.rebase.outputs.branch }}
+          fetch-depth: 0
 
-      - name: Checkout submodules
+      - name: Apply the fork's changes onto the release
         run: |
           git config --global --add safe.directory '*'
-          git submodule update --init --depth=1
+          ./ci/apply-extra-lan-patch.sh "${{ needs.prepare.outputs.tag }}"
+
+      - name: Checkout submodules
+        run: git submodule update --init --depth=1
+
+      - name: Verify the extra networks
+        run: cargo test --locked -p talpid-types
 
       - name: Build app
         run: |
@@ -231,7 +177,7 @@ jobs:
       - name: Upload packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: mullvad-tailscale-lan-${{ needs.rebase.outputs.tag }}-linux
+          name: mullvad-tailscale-lan-${{ needs.prepare.outputs.tag }}-linux
           path: |
             ./dist/*.deb
             ./dist/*.rpm
@@ -239,9 +185,9 @@ jobs:
 
   build-windows:
     name: Build Windows installer
-    needs: rebase
+    needs: prepare
     if: |
-      needs.rebase.outputs.pushed == 'true' &&
+      needs.prepare.outputs.skip != 'true' &&
       (github.event_name != 'workflow_dispatch' || inputs.build_windows)
     runs-on: windows-latest
     permissions:
@@ -249,17 +195,24 @@ jobs:
     steps:
       # By default, the longest path a filename can have in git on Windows is 260 characters.
       - name: Set git config for long paths
-        run: |
-          git config --system core.longpaths true
+        run: git config --system core.longpaths true
 
-      - name: Checkout tailscale-lan branch
+      - name: Checkout fork
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          ref: ${{ needs.rebase.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Apply the fork's changes onto the release
+        shell: bash
+        run: ./ci/apply-extra-lan-patch.sh "${{ needs.prepare.outputs.tag }}"
 
       # Installs msbuild, protoc, Node, the 32-bit Rust target and the Windows
       # submodules. This is the same action upstream's CI uses to build the app.
       - uses: ./.github/actions/mullvad-build-env
+
+      - name: Verify the extra networks
+        shell: bash
+        run: cargo test --locked -p talpid-types
 
       - name: Build app
         shell: bash
@@ -268,6 +221,6 @@ jobs:
       - name: Upload installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: mullvad-tailscale-lan-${{ needs.rebase.outputs.tag }}-windows
+          name: mullvad-tailscale-lan-${{ needs.prepare.outputs.tag }}-windows
           path: .\dist\*.exe
           if-no-files-found: error

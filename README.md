@@ -52,23 +52,23 @@ range on such a network bypasses the tunnel. Listing only your devices avoids th
 3. Open the **Actions** tab once and enable workflows. GitHub disables scheduled workflows on
    forks until the owner does this, and pauses them again after 60 days without repository
    activity.
-4. Run **Sync Tailscale LAN patch with upstream** from the Actions tab. It rebases the change onto
-   the newest upstream stable release, checks the file parses and the tests pass, pushes a
-   `tailscale-lan/<version>` branch, and builds:
+4. Run **Sync Tailscale LAN patch with upstream** from the Actions tab. It applies the change onto
+   the newest upstream stable release, checks the file parses and the tests pass, and builds:
    - Linux `.deb` and `.rpm` packages, inside Mullvad's own build container.
    - The Windows installer `.exe`, on a GitHub-hosted Windows runner.
 5. Download the packages from the run's artifacts and install them over the official app.
 
-The workflow also runs on its own once a day and builds whenever a new upstream release appears.
-A rebase conflict fails the run without pushing anything, and GitHub emails the repository
-owner.
+The workflow also runs on its own once a day, and only does work when a release it has not built
+yet appears. It pushes nothing to the repository. A conflict fails the run and GitHub emails the
+repository owner.
 
 The Windows installer is unsigned, so SmartScreen shows a warning on first run. The kernel
 drivers it installs are Mullvad's own signed binaries from the `dist-assets/binaries` submodule.
 
 ### Build locally (any platform, required for macOS)
 
-Follow the upstream [build instructions](BuildInstructions.md) to install the toolchains, then:
+Follow the upstream [build instructions](BuildInstructions.md) to install the toolchains, then
+build the fork's default branch directly:
 
 ```bash
 git submodule update --init
@@ -76,9 +76,18 @@ cargo run -p talpid-types --bin generate-extra-lan-nets   # after editing extra-
 ./build.sh --optimize
 ```
 
-The installer or packages end up in `dist/`. The first command turns the text file into the Rust
-constant that is compiled in (and refuses bad entries); the workflow runs it for you. On Windows
-the generated firewall header includes the extra networks as a pre-build step.
+The second command turns the text file into the Rust constant that is compiled in, and refuses bad
+entries. To build against a specific upstream release instead, from a clean checkout with full
+history:
+
+```bash
+ci/apply-extra-lan-patch.sh 2026.4   # any upstream tag; regenerates the constant for you
+git submodule update --init
+./build.sh --optimize
+```
+
+Either way the installer or packages end up in `dist/`. On Windows the generated firewall header
+includes the extra networks as a pre-build step.
 
 ## Where the change lives
 
@@ -88,7 +97,8 @@ the generated firewall header includes the extra networks as a pre-build step.
 | `talpid-types/src/net/extra_lan_config.rs` | Parses and validates the file. |
 | `talpid-types/src/bin/generate-extra-lan-nets.rs` | Writes the generated `talpid-types/src/net/extra_lan_nets.rs`. |
 | `talpid-types/src/net/allowed_nets.rs` | Upstream's list, plus the generated extras, form `ALLOWED_LAN_NETS`. |
-| `.github/workflows/sync-tailscale-lan.yml` | Daily rebase onto upstream releases and the Linux/Windows builds. |
+| `ci/apply-extra-lan-patch.sh` | Applies the fork's changes onto an upstream release tag. |
+| `.github/workflows/sync-tailscale-lan.yml` | Daily Linux and Windows builds against the newest upstream release. |
 | `docs/fork-tailscale-lan.md` | Longer write-up, including the security notes. |
 | `docs/security.md` | Upstream's firewall specification, with the file noted. |
 
