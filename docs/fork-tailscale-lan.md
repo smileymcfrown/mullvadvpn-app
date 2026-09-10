@@ -83,8 +83,10 @@ unsigned, so SmartScreen shows a warning on first run. The kernel drivers it
 installs are Mullvad's own signed binaries from the `dist-assets/binaries`
 submodule.
 
-The workflow pushes nothing to the repository, and the daily run does work
-only when it sees a release it has not built yet. Pushing a branch built
+The workflow pushes nothing to the repository. The daily run does work only
+when it sees a release it has not built yet, or when the network list has
+changed since the last build; the artifact names carry both the release and
+a fingerprint of the list. Pushing a branch built
 from an upstream release is not possible from Actions: such a branch
 necessarily changes files under `.github/workflows/`, and the automatic
 `GITHUB_TOKEN` is never allowed to create or update workflow files. No
@@ -99,9 +101,9 @@ To make it run on its own:
 2. Open the Actions tab once and enable workflows. GitHub disables scheduled
    workflows on forks until the owner does this, and pauses them again after
    60 days without repository activity.
-3. Optionally run it by hand from the Actions tab. Inputs let you pick a
-   specific upstream tag, force a rebuild when artifacts already exist, or
-   skip the Linux or Windows build.
+3. Optionally run it by hand from the Actions tab. Starting it by hand always
+   builds. Inputs let you pick a specific upstream tag or skip the Linux or
+   Windows build.
 
 For macOS, reproduce a build locally with the same script:
 
