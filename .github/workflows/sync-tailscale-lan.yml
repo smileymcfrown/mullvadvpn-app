@@ -5,8 +5,10 @@
 # What it does:
 #   1. Fetches upstream (mullvad/mullvadvpn-app) and picks the newest stable
 #      desktop release tag (YYYY.N), unless a tag is given as an input.
-#   2. Skips the run if artifacts for that release already exist, so the daily
-#      schedule only does work when upstream has actually released something.
+#   2. On the daily schedule only, skips the run if artifacts already exist for
+#      that release built from the current network list, so the schedule does
+#      work only when upstream releases or extra-lan-networks.txt changes.
+#      Starting the workflow by hand always builds.
 #   3. In each build job, applies this fork's changes onto that release with
 #      ci/apply-extra-lan-patch.sh (a three-way merge of the fork's net diff,
 #      which also regenerates the Rust constant from extra-lan-networks.txt),
@@ -43,10 +45,6 @@ on:
         description: Upstream release tag to build (default is the newest stable YYYY.N tag)
         type: string
         required: false
-      force:
-        description: Build even if artifacts for that release already exist
-        type: boolean
-        default: false
       build_linux:
         description: Build Linux packages
         type: boolean
@@ -71,6 +69,7 @@ jobs:
       actions: read
     outputs:
       tag: ${{ steps.pick.outputs.tag }}
+      config: ${{ steps.pick.outputs.config }}
       container_image: ${{ steps.pick.outputs.container_image }}
       skip: ${{ steps.built.outputs.skip }}
     steps:
@@ -107,32 +106,37 @@ jobs:
           # Build Linux inside the container that release itself was built with.
           image=$(git show "refs/remotes/upstream-tags/$tag:building/linux-container-image.txt")
           echo "container_image=$image" >> "$GITHUB_OUTPUT"
+          # Fingerprint the network list so that editing extra-lan-networks.txt
+          # produces a differently named artifact, and so the scheduled run
+          # notices the change. Comments and spacing are ignored.
+          normalized=$(sed 's/#.*//' extra-lan-networks.txt | tr -d '[:blank:]' | grep -v '^$' || true)
+          config=$(printf '%s' "$normalized" | sha256sum | cut -c1-8)
+          echo "Network list fingerprint: $config"
+          echo "config=$config" >> "$GITHUB_OUTPUT"
 
-      - name: Skip releases that were already built
+      # Only the daily schedule skips work. Starting the workflow by hand always
+      # builds, so there is never a reason to wonder why nothing happened.
+      - name: Skip if this release and network list were already built
         id: built
+        if: github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ steps.pick.outputs.tag }}
-          FORCE: ${{ inputs.force }}
+          CONFIG: ${{ steps.pick.outputs.config }}
         run: |
           set -euo pipefail
-          if [ "$FORCE" = "true" ]; then
-            echo "Forced; building regardless of existing artifacts."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           names=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
             --jq '.artifacts[] | select(.expired == false) | .name' || true)
           skip=true
           for platform in linux windows; do
-            if ! grep -qx "mullvad-tailscale-lan-$TAG-$platform" <<<"$names"; then
+            if ! grep -qx "mullvad-tailscale-lan-$TAG-$CONFIG-$platform" <<<"$names"; then
               skip=false
             fi
           done
           if [ "$skip" = "true" ]; then
-            echo "Artifacts for $TAG already exist; nothing to do."
-            echo "Re-run with the 'force' input to rebuild." >> "$GITHUB_STEP_SUMMARY"
+            echo "Artifacts for $TAG built from this network list already exist."
+            echo "Nothing to do. Start the workflow by hand to build anyway."
           fi
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
 
@@ -177,7 +181,7 @@ jobs:
       - name: Upload packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: mullvad-tailscale-lan-${{ needs.prepare.outputs.tag }}-linux
+          name: mullvad-tailscale-lan-${{ needs.prepare.outputs.tag }}-${{ needs.prepare.outputs.config }}-linux
           path: |
             ./dist/*.deb
             ./dist/*.rpm
@@ -221,6 +225,6 @@ jobs:
       - name: Upload installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: mullvad-tailscale-lan-${{ needs.prepare.outputs.tag }}-windows
+          name: mullvad-tailscale-lan-${{ needs.prepare.outputs.tag }}-${{ needs.prepare.outputs.config }}-windows
           path: .\dist\*.exe
           if-no-files-found: error

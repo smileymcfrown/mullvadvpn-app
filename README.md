@@ -58,8 +58,9 @@ range on such a network bypasses the tunnel. Listing only your devices avoids th
    - The Windows installer `.exe`, on a GitHub-hosted Windows runner.
 5. Download the packages from the run's artifacts and install them over the official app.
 
-The workflow also runs on its own once a day, and only does work when a release it has not built
-yet appears. It pushes nothing to the repository. A conflict fails the run and GitHub emails the
+Starting the workflow by hand always builds. It also runs on its own once a day, and then only
+does work when a new release appears or when you have edited `extra-lan-networks.txt` since the
+last build. It pushes nothing to the repository. A conflict fails the run and GitHub emails the
 repository owner.
 
 The Windows installer is unsigned, so SmartScreen shows a warning on first run. The kernel
