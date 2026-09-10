@@ -37,4 +37,4 @@
 # Note: Tailscale IPv6 addresses (fd7a:115c:a1e0::/48) are already inside the
 # fc00::/7 range that the unmodified app allows, so listing them is optional.
 
-100.64.0.0/10
+100.127.46.0/26
