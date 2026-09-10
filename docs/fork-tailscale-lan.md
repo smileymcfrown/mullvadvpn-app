@@ -39,6 +39,8 @@ This stops a typo from exempting public internet addresses from the tunnel.
   `talpid-types/src/net/extra_lan_nets.rs`, a generated file that is
   committed. (A Cargo build script was not used on purpose: a crate can only
   have one, and upstream adds and removes its own.)
+- `ci/apply-extra-lan-patch.sh` applies all of the above onto an upstream
+  release tag, for the workflow and for local builds.
 - `talpid-types/src/net/allowed_nets.rs` keeps upstream's six entries as
   `BASE_LAN_NETS` and defines `ALLOWED_LAN_NETS` as base plus extras. Every
   platform firewall (Linux nftables, macOS pf, Android routes, and the
@@ -65,11 +67,12 @@ This stops a typo from exempting public internet addresses from the tunnel.
 
 ## Staying current with upstream
 
-The workflow in `.github/workflows/sync-tailscale-lan.yml` applies the
-fork's net changes onto each new upstream stable release as one commit
-(three-way merge, so it works whether the fork's base is older or newer
-than the release), verifies the file parses and the tests pass, pushes
-`tailscale-lan/<tag>`, and builds:
+The workflow in `.github/workflows/sync-tailscale-lan.yml` builds the fork
+against each new upstream stable release. It runs
+`ci/apply-extra-lan-patch.sh`, which applies the fork's net changes onto
+the release as one commit (a three-way merge, so it works whether the
+fork's base is older or newer than the release) and regenerates the Rust
+constant. It then verifies the tests pass and builds:
 
 - Linux `.deb` and `.rpm` packages inside Mullvad's own build container.
 - The Windows installer `.exe` on a GitHub-hosted Windows runner, using the
@@ -80,6 +83,15 @@ unsigned, so SmartScreen shows a warning on first run. The kernel drivers it
 installs are Mullvad's own signed binaries from the `dist-assets/binaries`
 submodule.
 
+The workflow pushes nothing to the repository, and the daily run does work
+only when it sees a release it has not built yet. Pushing a branch built
+from an upstream release is not possible from Actions: such a branch
+necessarily changes files under `.github/workflows/`, and the automatic
+`GITHUB_TOKEN` is never allowed to create or update workflow files. No
+setting in the workflow lifts that; it would take a personal access token
+with the Workflows permission, stored as a repository secret. Building the
+artifacts directly avoids needing one.
+
 To make it run on its own:
 
 1. Merge this branch into the fork's default branch. GitHub only schedules
@@ -88,9 +100,16 @@ To make it run on its own:
    workflows on forks until the owner does this, and pauses them again after
    60 days without repository activity.
 3. Optionally run it by hand from the Actions tab. Inputs let you pick a
-   specific upstream tag, force a rebuild of an existing branch, or skip the
-   Linux or Windows build.
+   specific upstream tag, force a rebuild when artifacts already exist, or
+   skip the Linux or Windows build.
 
-For macOS, check out `tailscale-lan/<tag>` and build locally as described in
-`BuildInstructions.md`. If the patch does not apply cleanly the run fails and
-GitHub emails the repository owner; nothing is pushed in that case.
+For macOS, reproduce a build locally with the same script:
+
+```bash
+ci/apply-extra-lan-patch.sh <tag>
+git submodule update --init
+./build.sh --optimize
+```
+
+If the patch does not apply cleanly the run fails and GitHub emails the
+repository owner.
